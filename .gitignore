@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.pyc
+
+# Virtual environment
+.venv/
+
+# Secrets — never commit API keys
+.env
+
+# Audio assets: large and possibly copyrighted. Keep the folder, ignore the songs.
+assets/*.ogg
+
+# Scratch/source audio + duplicate code snapshots (copyrighted .mp3s live here).
+downloads/
+
+# Stray sandbox export artifacts.
+mnt/

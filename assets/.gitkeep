@@ -1,0 +1,2 @@
+# Keeps the assets/ folder in git. The .ogg song files here are intentionally
+# gitignored (large + possibly copyrighted) — drop them back in locally to run.

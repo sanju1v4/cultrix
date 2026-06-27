@@ -1,0 +1,9 @@
+# HoldVibes — LiveKit voice agent
+# Pin to the 1.6.x line you scaffolded against; bump only if you check the API.
+livekit-agents[openai,silero]~=1.6
+python-dotenv~=1.0
+
+# Optional, if you prefer these providers over OpenAI for STT/TTS:
+# livekit-plugins-deepgram
+# livekit-plugins-cartesia
+# livekit-plugins-elevenlabs   # telli themselves use ElevenLabs voices — nice touch
