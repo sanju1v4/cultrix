@@ -1,133 +1,137 @@
-# HoldVibes 🎧
+# HoldVibes — the hold line that plays a World Cup guessing game
 
-**The voice agent that turns hold music into the best part of the call.**
+A voice agent for the worst part of any phone call: being on hold. Instead of
+elevator music, HoldVibes turns the wait into a fast, friendly **World Cup anthem
+guessing game**, hosted by an AI with the energy of a late-night radio DJ.
 
-Most people hang up while waiting on hold — and a lot of them were ready to buy.
-HoldVibes keeps the caller on the line by turning the dead air into a 60-second
-interactive cultural moment, in *their* language, then hands off cleanly the
-instant a human is ready.
+## The concept
 
-Built for the telli × LiveKit Voice AI Hack.
+1. You're stuck on hold. A playful host greets you and offers a quick game.
+2. The agent **plays a real World Cup anthem snippet** — that snippet *is* the clue.
+3. You guess the **host country** of that World Cup.
+4. The agent reveals the answer: the real **song, artist, and year**, then keeps score.
 
----
+The music **ducks down low while the agent talks** so the voice is always clear,
+then swells back up between turns.
 
-## The idea in one breath
+### The Wavin' Flag trap 🪤
 
-The hold music stops being something you endure and becomes something you play
-with. The caller picks a vibe, the music re-skins to a culture (Berlin techno,
-Mumbai filmi, Lagos afrobeat…), the agent drops one true cultural note, and you
-can morph the tune on command or get a tiny custom hold-anthem about why you
-called. Underneath, it's quietly productive: it grabs your order number so the
-human is faster.
+One round is a deliberate trick. It plays K'naan's **"Wavin' Flag"** — which most
+people "know" was the 2010 World Cup song. The reveal sets the record straight:
+"Wavin' Flag" was the **Coca-Cola promotional anthem**, *not* FIFA's official
+World Cup song (that was Shakira's **"Waka Waka"**). The host country is still
+South Africa — so the answer can be right even when the trivia surprises you.
 
-## The architecture (say this to the judges)
+## Architecture — why the answers are trustworthy
 
-> **The model picks the move and does the banter; the engine owns every fact
-> and every number.**
+> **The model picks the move and does the banter; the engine owns every fact and
+> every number.**
 
-```
-  caller speaks
-       │
-  LiveKit  (STT · turn-detection · interruptions)   ← the hard real-time stuff
-       │
-  LLM      decides which tool to call, phrases the reply with personality
-       │
-  engine/  ← DETERMINISTIC. owns: which track plays, whether a guess is right,
-  games.py    the score, what a "morph" resolves to, the anthem's rules.
-              No LLM. No hallucinated facts. Unit-tested on its own.
-       │
-  music    background track on its own channel — agent talks over it & ducks it
-```
+- **`engine/`** is plain, deterministic Python with no LiveKit imports. It decides
+  which track plays, whether a guess is correct, the running score, and every
+  spoken fact. You can run and unit-test it on its own.
+- **`agent.py`** is a thin voice layer. The LLM's only jobs are (1) choosing which
+  engine tool to call and (2) phrasing the result with personality. It never holds
+  the score or the hidden answer in its head — that lives in `HoldState`, which is
+  attached to the session and mutated only by engine code.
 
-`engine/` has **zero** LiveKit imports, so it runs and tests standalone. That's
-deliberate: a green engine means you have a demo even if the voice glue is still
-flaky at 4pm.
+This split means the fun, improvised banter can never corrupt a score or invent a
+"fact" — the things that must be correct are decided in code judges can read.
+
+## Project structure
 
 ```
-holdvibes/
-├── engine/            # the deterministic core (the part to be proud of)
-│   ├── library.py     #   curated vibes + true cultural facts + language skins
-│   ├── state.py       #   per-call state (score, pending answer, captured info)
-│   └── games.py       #   selection, scoring, morph, anthem spec  ← run this
-├── agent.py           # LiveKit glue: session, tools, music control, handoff
-├── assets/            # drop your 8 short music loops here (see assets/README)
-├── requirements.txt
-└── .env.example
+agent.py              # LiveKit voice agent: tools, persona, music ducking
+engine/
+  __init__.py
+  library.py          # Track data: the rounds, host answers, clues, reveal facts
+  games.py            # Deterministic core: pick round, check guess, score
+  state.py            # HoldState: per-call score/answer/captured details
+assets/               # .ogg song clips live here (NOT committed — see below)
+  .gitkeep
+.env.example          # Copy to .env and fill in your keys
+requirements.txt
 ```
 
 ## Setup
 
+1. **Python 3.10+**, then install dependencies (a virtualenv is recommended):
+   ```bash
+   pip install -r requirements.txt
+   ```
+2. **Keys.** Copy the template and fill it in:
+   ```bash
+   cp .env.example .env
+   ```
+   You'll need a **LiveKit** project (URL + API key/secret) and an **OpenAI** key
+   (used for STT `gpt-4o-transcribe`, LLM `gpt-4.1-mini`, and TTS `alloy`).
+3. **Audio clips.** The `.ogg` song snippets are **not** in the repo (large and
+   possibly copyrighted). Drop your own clips into `assets/`. The engine activates
+   a round as a "play-the-song" clue **only when its `.ogg` file is present**; the
+   currently-wired audio rounds expect:
+   - `assets/wc2010_southafrica.ogg` — "Waka Waka" (Shakira)
+   - `assets/wc2014_brazil.ogg` — "We Are One" (Pitbull ft. J.Lo)
+   - `assets/wc2010_wavinflag.ogg` — "Wavin' Flag" (K'naan) — the trap
+   - `assets/stadium_bed.ogg` — the neutral bed before a round starts
+
+   If **no** clips are present, the game still runs — it falls back to spoken text
+   clues for the full 1990–2022 set instead of playing audio.
+
+## Running
+
+**Verify the engine first (no audio or network needed):**
 ```bash
-python -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-cp .env.example .env          # fill in LIVEKIT_* and OPENAI_API_KEY
-# add your loops to assets/  (see assets/README.md)
+python -m engine.games        # prints "ALL ENGINE CHECKS PASSED ✅"
 ```
 
-## Run
-
+**Talk to it locally (terminal voice, no background music):**
 ```bash
-# 1) Prove the engine works — no creds, no audio, instant:
-python -m engine.games        # -> ALL ENGINE CHECKS PASSED ✅
-
-# 2) Iterate on the conversation fast (terminal mic, NO background music):
 python agent.py console
-
-# 3) Full demo (music track needs a real room):
-python agent.py dev
-#    then connect via the LiveKit Agents Playground or your own token page,
-#    and have a teammate join the room to trigger the live handoff.
 ```
 
-> Background audio is intentionally disabled in `console` mode — use `console`
-> for logic, `dev` + a room for the music demo.
+**Full demo with the music track (needs a room + frontend):**
+```bash
+python agent.py dev
+```
+then connect with the [LiveKit Agents Playground](https://agents-playground.livekit.io/)
+(or your own token page). Watch the terminal for `registered worker` and, when you
+connect, `received job request`.
 
----
+### Windows note
 
-## The 6-hour battle plan (build risky-first)
+LiveKit's CLI prints emoji that crash a default `cp1252` Windows console. `agent.py`
+already fixes this at startup (it reconfigures `stdout`/`stderr` to UTF-8), so
+`python agent.py console` works out of the box. For other scripts (e.g. the engine
+self-test's `✅`), force UTF-8:
+```powershell
+$env:PYTHONIOENCODING='utf-8'; python -m engine.games
+```
 
-Building starts 10:30, demos at 17:00. Order matters — do the thing most likely
-to break **first**.
+## Demo script (≈60 seconds)
 
-- **10:30–11:30 — Audio spine (the risk).** Get `agent.py dev` up with music
-  looping on the background track and the agent able to talk over it *and be
-  interrupted*. If this works, you have a demo. Everything else is content.
-  → de-risk the three `# VERIFY` spots in `agent.py` here (BackgroundAudioPlayer
-    signature, `AudioConfig`/`play(loop=)`, `PlayHandle.stop()`). Ask Codex or
-    the LiveKit MCP server; don't burn 40 minutes guessing.
-- **11:30–12:30 — The swap.** Wire `morph_music` + `play_guessing_round` so the
-  music visibly re-skins on command. The boring→cultural swap is your "whoa".
-- **12:30–13:00 — Lunch / let it breathe.**
-- **13:00–14:00 — Language re-skin.** `set_language` mid-call → music + greeting
-  change together. This is the beat that flatters telli's multilingual moat.
-- **14:00–14:45 — Productive beat + handoff.** `capture_detail`, then the
-  teammate-joins-room handoff with the spoken brief.
-- **14:45–15:30 — Anthem + lore** as bonus mechanics if time allows.
-- **15:30–16:15 — Ducking polish + bake the 8 loops** so it sounds good.
-- **16:15–17:00 — Rehearse the 90 seconds. Twice.** A clean run beats a
-  feature nobody sees.
+1. **Greeting.** Agent: *"Stuck on hold? Okay okay — let's play. Quick World Cup round?"*
+2. **Round + snippet.** A real anthem plays; the music ducks as the agent speaks:
+   *"Name this one — which country hosted? Italy, Brazil, South Africa, or Qatar?"*
+3. **Guess + reveal.** You say *"South Africa."* Engine scores it, agent celebrates:
+   *"OHHH, yes! That's Shakira's 'Waka Waka,' 2010 — South Africa's first World Cup."*
+4. **The trap.** Next snippet is "Wavin' Flag." You confidently say *"That's the 2010
+   World Cup song!"* — Agent reveals from the engine: *"Host's right, South Africa —
+   but gotcha: 'Wavin' Flag' was Coca-Cola's promo anthem. FIFA's official song was
+   'Waka Waka.'"*
+5. **(Optional) productive beat.** Agent offers to grab your order number so a human
+   picks up faster.
 
-If you fall behind, cut in this order: anthem → lore → ducking → language.
-**Never cut:** music swap, interruption, handoff. Those three *are* the demo.
+## Also wired (secondary tools)
 
-## The 90-second demo script
+Beyond the core game, the agent exposes a few extra engine-backed tools the host
+can reach for. They follow the same rule — the engine owns the facts:
 
-1. "Every one of you has rage-quit a hold queue. After two minutes, ~60% hang
-   up — and a lot of them were ready to buy." → phone rings, "all agents busy",
-   the dull tune starts.
-2. Agent pipes up: *"Stuck on hold? I can fix the music. Want to travel?"* →
-   **morph to Berlin techno** live. (room reacts)
-3. Quick guess-the-vibe round → caller nails it → agent rewards with the real
-   cultural fact. *(engine scored that, not the model — mention it.)*
-4. Switch to German mid-call → whole thing re-skins. *(telli's exact strength)*
-5. *"By the way, grabbed your order number so they're faster."* → teammate
-   joins the room → agent gives its one-line brief → goes quiet → handoff.
-6. Land it: *"We didn't make a better hold experience. We made one nobody hangs
-   up on."*
-
-## Honest gaps to own if asked
-- Music is pre-baked, not generated live (a feature, not a bug — faster & better).
-- Auto language-detection is light; in the demo you can also just ask. The
-  re-skin machinery is the real point.
-- Single-call demo, not load-tested — but the engine/voice split is exactly the
-  shape that *would* scale.
+- **Language re-skin** (`set_language`) — switches the greeting and biases the next
+  round toward a caller's language/home region (en/de/pt/fr/it/es).
+- **Morph the bed** (`morph_music`) — free-text style ("make it Brazilian") resolves
+  deterministically to one of the real tracks.
+- **Hold anthem** (`hold_anthem`) — the engine returns the *rules* (language, 4 lines,
+  AABB rhyme, required topic); the LLM improvises the words.
+- **Hold lore** (`hold_lore`) — a true factual aside for the wait.
+- **Human handoff** (`connect_to_human`) — when a second participant joins the room,
+  the agent gives a one-line brief (captured details + score) and goes quiet.
