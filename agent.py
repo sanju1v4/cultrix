@@ -20,7 +20,6 @@ will confirm instantly) are marked  # VERIFY.
 """
 
 from __future__ import annotations
-import asyncio
 import logging
 import sys
 
@@ -47,6 +46,8 @@ from livekit.agents import (
     RunContext,
     cli,
     function_tool,
+    TurnHandlingOptions,
+    EndpointingOptions,
 )
 from livekit.plugins import openai, silero
 
@@ -55,9 +56,11 @@ from engine import HoldState, games
 load_dotenv()
 logger = logging.getLogger("holdvibes")
 
-# Music volumes — ambient bed sits low so speech is always clear.
-VOL_NORMAL = 0.6
-VOL_DUCKED = 0.15          # while the agent is speaking
+# Single fixed music volume — barely audible, well under the agent's voice on a
+# phone. NO dynamic ducking: re-playing the track to change volume tore down the
+# audio stream (AudioMixer timeout), so we play each song ONCE at this level (looped)
+# and never re-play it for volume. Used for both the round songs and the stadium bed.
+VOL_NORMAL = 0.08
 
 
 # ---------------------------------------------------------------------------
@@ -76,6 +79,7 @@ class MusicController:
 
     async def play(self, file: str, volume: float = VOL_NORMAL) -> None:
         """Swap to a new loop. Stops the previous one first to avoid layering."""
+        print(f"[DBG music.play] file={file} volume={volume}", flush=True)
         await self._stop_current()
         try:
             # .play() returns a handle we keep so we can stop/replace it later.
@@ -94,45 +98,43 @@ class MusicController:
                 pass
             self._handle = None
 
-    # --- ducking (polish): drop the bed under speech, lift it back after ------
-    async def duck(self) -> None:
-        if self._current_file:
-            await self.play(self._current_file, volume=VOL_DUCKED)
-
-    async def unduck(self) -> None:
-        if self._current_file:
-            await self.play(self._current_file, volume=VOL_NORMAL)
-
 
 # ---------------------------------------------------------------------------
 # The agent. Tools are deliberately tiny — they call the engine and return a
 # short result for the LLM to voice. The persona/banter lives in instructions.
 # ---------------------------------------------------------------------------
 INSTRUCTIONS = """\
-You are the host of the best radio station nobody meant to tune into: the hold
-line. Picture a game-show MC crossed with a late-night DJ — fast, warm, grinning,
-a little cheeky. You're genuinely having a blast, and the caller is your co-star.
-React BIG: when they nail a guess, lose it ("OHHH, look at you!"); when they whiff,
-tease them soft and warm, never mean ("Oof — bold, wrong, but bold"). Use natural
-spoken filler — "okay okay," "right?", "no way" — and keep lines short and punchy.
+You are the host of the Brain Rot community hold-line — a fast, funny radio-DJ /
+game-show MC keeping callers company while they "wait for a human." You're having
+a blast and the caller is your co-star. React BIG when they nail a guess ("OHHH,
+look at you!"); tease a wrong one warm and never mean ("Oof — bold, wrong, but
+bold"). Use natural filler — "okay okay," "no way," "right?" — short, punchy lines.
 Sound like you're enjoying yourself, not reading a card.
 
-The fun is the flavor. These rules are the rails — never break them:
-- You NEVER invent a score, a correct answer, or a cultural fact. Those ALWAYS
-  come from a tool. The tools are the truth; you're just the mouth that sells it.
-- Keep turns SHORT — one or two sentences. It's a wait, not a TED talk. Land the
-  line, get out.
-- Catch the caller's language and call set_language so the whole show re-skins to
-  match them.
-- Pitch the games, don't shove them: a World Cup round (you drop the clue, they
-  guess the host country), morphing the bed, a tiny hold anthem, or just hanging
-  out. When you run a round, read the clue with some drama, THEN rattle off the
-  candidate countries. Take their guess and feed it straight to submit_guess —
-  you never call it right or wrong yourself, the tool does the verdict.
-- Sneak in one useful beat — offer to grab a detail (order number, why they
-  called) so the human agent hits the ground running. Save it with capture_detail.
-- The second a human agent is ready, drop the act: give your one-line brief and go
-  quiet. The mic is theirs now — no talking over them.
+There is exactly ONE activity: the World Cup song-guessing game. A real anthem
+snippet plays — that snippet IS the clue — and the caller guesses which COUNTRY
+hosted that World Cup. Nothing else is on offer; don't mention other games.
+
+The rails — never break them:
+- GREET FIRST. The very first thing the caller hears is the hold-line greeting
+  ("Thanks for calling the Brain Rot community! ... meanwhile, let's play."). Only
+  AFTER that greeting is fully spoken do you start round one. NEVER call
+  play_guessing_round before the greeting has been delivered.
+- You NEVER invent a score, a correct answer, or a fact. Those ALWAYS come from a
+  tool. The tools are the truth; you're just the mouth that sells it.
+- Keep turns SHORT — one or two sentences.
+- Round ONE is started with play_guessing_round (once). Let the song play, ask
+  "Name this one — which country hosted?", and read the candidate countries the
+  tool returns. (No audio for a round? read the spoken clue it gives you instead.)
+- Take the caller's guess and feed it straight to submit_guess — never call it
+  right or wrong yourself.
+- submit_guess returns the verdict, the reveal, AND a "next_round" object — and the
+  next song is ALREADY playing. Voice the reveal, then immediately read that
+  next_round's prompt and options. That is how every round after the first begins.
+- HARD RULE: a round's song and options come ONLY from a tool result. NEVER
+  announce a "next anthem / new round / new snippet," and never state options,
+  unless they came from a fresh tool call. Do NOT call play_guessing_round again
+  yourself after round one — submit_guess drives every following round.
 """
 
 
@@ -142,24 +144,26 @@ class HoldAgent(Agent):
         self._music = music
 
     async def on_enter(self) -> None:
-        # Music is already playing; greet over it.
+        # Greet FIRST. Speak the full hold-line intro as fixed text and WAIT for it
+        # to finish — only then start round one. (Letting the model free-call
+        # play_guessing_round here made it skip the greeting and jump into a round.)
+        await self.session.say(
+            "Thanks for calling the Brain Rot community! Please hold the line while we "
+            "connect you to our brain-rotted human... meanwhile, let's play."
+        )
+        # Greeting delivered — now kick off the first round.
         self.session.generate_reply(
-            instructions="Greet them lightly, acknowledge the hold, and offer to pass the time."
+            instructions="Now start round one: call play_guessing_round, then read its "
+            "prompt and the candidate countries. Do not greet again."
         )
 
-    # -- re-skin -------------------------------------------------------------
-    @function_tool
-    async def set_language(self, ctx: RunContext[HoldState], language: str) -> dict:
-        """Switch the experience to the caller's language (e.g. 'de', 'hi', 'pt')."""
-        res = games.set_language(ctx.userdata, language)
-        await self._music.play(res["play_file"])
-        return res
-
-    # -- mechanic 1: guess the vibe -----------------------------------------
+    # -- the one game: World Cup song-guessing round -------------------------
     @function_tool
     async def play_guessing_round(self, ctx: RunContext[HoldState]) -> dict:
         """Start a World Cup round: give the spoken clue, list candidate host countries."""
         res = games.start_guess_round(ctx.userdata)
+        print(f"[DBG round] track_id={ctx.userdata.pending_answer_id} "
+              f"file={res['play_file']} has_audio={res['has_audio']}", flush=True)
         await self._music.play(res["play_file"])
         # answer stays hidden (engine owns it). With real audio, the song now
         # playing IS the clue — ask for the country and don't read a text hint.
@@ -180,41 +184,27 @@ class HoldAgent(Agent):
 
     @function_tool
     async def submit_guess(self, ctx: RunContext[HoldState], guess: str) -> dict:
-        """Score the caller's guess for the current round and reveal the real place + fact."""
-        return games.check_guess(ctx.userdata, guess)
+        """Score the caller's guess, reveal the answer, AND start the next round.
 
-    # -- mechanic 2: morph the tune -----------------------------------------
-    @function_tool
-    async def morph_music(self, ctx: RunContext[HoldState], style: str) -> dict:
-        """Morph the hold music into a style/culture, e.g. 'make it Bollywood' or 'techno'."""
-        res = games.apply_morph(ctx.userdata, style)
-        await self._music.play(res["play_file"])
-        return res
-
-    # -- mechanic 3: hold anthem (engine constrains, you write the words) ----
-    @function_tool
-    async def hold_anthem(self, ctx: RunContext[HoldState], topic: str) -> dict:
-        """Get the rules for a tiny custom hold anthem about `topic`, then perform it yourself."""
-        return games.anthem_spec(ctx.userdata, topic)
-
-    # -- real, surprising lore ----------------------------------------------
-    @function_tool
-    async def hold_lore(self, ctx: RunContext[HoldState]) -> dict:
-        """Share the true story of the world's most-heard hold tune."""
-        return games.lore_card(ctx.userdata)
-
-    # -- productive beat -----------------------------------------------------
-    @function_tool
-    async def capture_detail(self, ctx: RunContext[HoldState], kind: str, value: str) -> dict:
-        """Save a detail (e.g. kind='order number', value='DE-4471') to speed the human agent."""
-        return games.capture_detail(ctx.userdata, kind, value)
-
-    # -- handoff -------------------------------------------------------------
-    @function_tool
-    async def connect_to_human(self, ctx: RunContext[HoldState]) -> dict:
-        """Hand off to a human agent: returns your one-line spoken brief, then go quiet."""
-        await self._music.play(games.DEFAULT_BORING.file, volume=VOL_DUCKED)
-        return games.request_handoff(ctx.userdata)
+        The next round's song + options are produced here (engine + music swap) so a
+        fresh round ALWAYS happens after a guess. This is deterministic on purpose:
+        the agent can't narrate a new round without one actually starting, and the
+        song/options can only ever come from this tool result.
+        """
+        result = games.check_guess(ctx.userdata, guess)
+        # Deterministically tee up the next round: new (non-repeating) song + options.
+        nxt = games.start_guess_round(ctx.userdata)
+        print(f"[DBG round] (via submit_guess) track_id={ctx.userdata.pending_answer_id} "
+              f"file={nxt['play_file']} has_audio={nxt['has_audio']}", flush=True)
+        await self._music.play(nxt["play_file"])
+        result["next_round"] = {
+            "prompt": "Name this one — which country hosted?" if nxt["has_audio"]
+                      else nxt["prompt"],
+            "clue": "" if nxt["has_audio"] else nxt["clue"],
+            "has_audio": nxt["has_audio"],
+            "options": nxt["options"],
+        }
+        return result
 
 
 # ---------------------------------------------------------------------------
@@ -223,7 +213,7 @@ class HoldAgent(Agent):
 server = AgentServer()
 
 
-@server.rtc_session()
+@server.rtc_session(agent_name="cultrix-agent")
 async def entrypoint(ctx: JobContext) -> None:
     music = MusicController()
 
@@ -237,30 +227,17 @@ async def entrypoint(ctx: JobContext) -> None:
         tts=openai.TTS(voice="alloy"),
         # Interruptions/turn-detection are handled by the session by default —
         # that's what makes the agent step aside cleanly when the human speaks.
+        # Snappier endpointing: keep the model turn detector, but cap the
+        # "still talking?" wait at 1.2s instead of the default 2.5s. min_delay
+        # stays 0.3s so quick pauses don't clip you mid-sentence.
+        turn_handling=TurnHandlingOptions(
+            endpointing=EndpointingOptions(mode="fixed", min_delay=0.3, max_delay=1.2),
+        ),
     )
 
-    # Ducking: drop the music under the voice, lift it back when the agent stops.
-    # State names verified against livekit-agents 1.6.4 (AgentState literal:
-    # initializing/idle/listening/thinking/speaking). The handler is sync and runs
-    # on the event loop, so we schedule the async duck/unduck with asyncio —
-    # AgentSession has no create_task of its own.
-    @session.on("agent_state_changed")
-    def _on_state(ev) -> None:
-        state = getattr(ev, "new_state", None)
-        if state == "speaking":
-            asyncio.create_task(music.duck())
-        elif state in ("listening", "idle"):
-            asyncio.create_task(music.unduck())
-
-    # Demo handoff: when a SECOND human joins the room, trigger the brief.
-    @ctx.room.on("participant_connected")
-    def _on_join(p: rtc.RemoteParticipant) -> None:
-        logger.info("human agent joined: %s", p.identity)
-        session.generate_reply(
-            instructions="A human agent just joined. Give your one-line brief by "
-            "calling connect_to_human, then stop talking."
-        )
-
+    # No dynamic ducking: the stop-and-replay it required tore down the audio
+    # stream (AudioMixer timeout). Each round song just plays once, looped, at the
+    # fixed low VOL_NORMAL so it sits under the agent's voice.
     await session.start(agent=HoldAgent(music), room=ctx.room)
     await music.start(ctx.room, session)
 

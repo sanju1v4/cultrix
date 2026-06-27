@@ -20,6 +20,9 @@ class HoldState:
     # The currently playing vibe (Track.id), so morph/guess know the context.
     current_track_id: str = "opus1"
 
+    # The previous round's track, so a new round won't repeat it back-to-back.
+    last_track_id: str | None = None
+
     # An in-flight guessing round: the correct Track.id is stashed here and
     # NEVER sent to the LLM until the guess is checked.
     pending_answer_id: str | None = None

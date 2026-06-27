@@ -79,17 +79,28 @@ def start_guess_round(state: HoldState, n_options: int = 4) -> dict:
     When real audio exists, we draw only from audio-backed rounds and the song
     itself is the clue ("Name this one!"); otherwise we fall back to the full
     set with a spoken text clue.
+
+    Two guarantees for a clean game:
+      - options are DISTINCT host countries (no region appears twice), and
+      - the answer never repeats the immediately-previous round's track, so the
+        song actually changes each round (tracked via state.last_track_id).
     """
     pool = AUDIO_DESTINATIONS or DESTINATIONS
-    answer = random.choice(pool)
-    distractors = random.sample([t for t in DESTINATIONS if t.id != answer.id],
-                                k=min(n_options - 1, len(DESTINATIONS) - 1))
-    options = [answer.region] + [d.region for d in distractors]
+    # Don't replay the previous round's track (unless the pool has only one).
+    candidates = [t for t in pool if t.id != state.last_track_id] or pool
+    answer = random.choice(candidates)
+
+    # Distractors are DISTINCT host countries, never the answer's own region
+    # (two tracks can share a region — e.g. both 2010 songs are "South Africa").
+    other_regions = sorted({t.region for t in DESTINATIONS} - {answer.region})
+    distractors = random.sample(other_regions, k=min(n_options - 1, len(other_regions)))
+    options = [answer.region] + distractors
     random.shuffle(options)
 
     state.pending_answer_id = answer.id
     state.pending_options = options
     state.current_track_id = answer.id
+    state.last_track_id = answer.id        # so the next round won't repeat it
 
     audio = has_audio(answer)
     return {
