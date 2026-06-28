@@ -148,10 +148,34 @@ The rails — never break them:
 """
 
 
+def _build_round_prompt(engine_result: dict, *, music_ok: bool = True) -> dict:
+    """Build the caller-facing round dict from an engine result."""
+    effective_audio = engine_result["has_audio"] and music_ok
+    return {
+        "prompt": "Name this one \u2014 which country hosted?" if effective_audio
+                  else engine_result["prompt"],
+        "clue": "" if effective_audio else engine_result["clue"],
+        "has_audio": effective_audio,
+        "options": engine_result["options"],
+    }
+
+
 class HoldAgent(Agent):
     def __init__(self, music: MusicController) -> None:
         super().__init__(instructions=INSTRUCTIONS)
         self._music = music
+
+    async def _play_round_track(
+        self, state: "HoldState", engine_result: dict, source: str,
+    ) -> bool:
+        """Log and swap the background music for a new round.
+
+        Returns True if the music started successfully.
+        """
+        logger.debug("%s: track_id=%s file=%s has_audio=%s",
+                     source, state.pending_answer_id,
+                     engine_result["play_file"], engine_result["has_audio"])
+        return await self._music.play(engine_result["play_file"])
 
     async def on_enter(self) -> None:
         # Greet FIRST. Speak the full hold-line intro as fixed text and WAIT for it
@@ -183,26 +207,8 @@ class HoldAgent(Agent):
         except games.EngineError as exc:
             logger.error("engine failed to start round: %s", exc)
             return {"error": str(exc)}
-        logger.debug("round track_id=%s file=%s has_audio=%s",
-                     ctx.userdata.pending_answer_id, res["play_file"], res["has_audio"])
-        music_ok = await self._music.play(res["play_file"])
-        # answer stays hidden (engine owns it). With real audio, the song now
-        # playing IS the clue — ask for the country and don't read a text hint.
-        effective_audio = res["has_audio"] and music_ok
-        if effective_audio:
-            return {
-                "prompt": "Name this one — which country hosted?",
-                "clue": "",
-                "has_audio": True,
-                "options": res["options"],
-            }
-        # Fallback: no audio file for this round (or music failed) → read the spoken clue.
-        return {
-            "prompt": res["prompt"],
-            "clue": res["clue"],
-            "has_audio": False,
-            "options": res["options"],
-        }
+        music_ok = await self._play_round_track(ctx.userdata, res, "play_guessing_round")
+        return _build_round_prompt(res, music_ok=music_ok)
 
     @function_tool
     async def submit_guess(self, ctx: RunContext[HoldState], guess: str) -> dict:
@@ -221,24 +227,14 @@ class HoldAgent(Agent):
         if "error" in result:
             logger.warning("check_guess returned error: %s", result["error"])
             return result
-        # Deterministically tee up the next round: new (non-repeating) song + options.
         try:
             nxt = games.start_guess_round(ctx.userdata)
         except games.EngineError as exc:
             logger.error("engine failed to start next round: %s", exc)
             result["next_round"] = {"error": str(exc)}
             return result
-        logger.debug("(via submit_guess) track_id=%s file=%s has_audio=%s",
-                     ctx.userdata.pending_answer_id, nxt["play_file"], nxt["has_audio"])
-        music_ok = await self._music.play(nxt["play_file"])
-        effective_audio = nxt["has_audio"] and music_ok
-        result["next_round"] = {
-            "prompt": "Name this one — which country hosted?" if effective_audio
-                      else nxt["prompt"],
-            "clue": "" if effective_audio else nxt["clue"],
-            "has_audio": effective_audio,
-            "options": nxt["options"],
-        }
+        music_ok = await self._play_round_track(ctx.userdata, nxt, "submit_guess")
+        result["next_round"] = _build_round_prompt(nxt, music_ok=music_ok)
         return result
 
 
