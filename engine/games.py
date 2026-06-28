@@ -23,6 +23,7 @@ from .library import (
     LANGUAGE_SKINS, DEFAULT_LANGUAGE,
 )
 from .state import HoldState
+from .utils import normalize_text, match_region
 
 logger = logging.getLogger("holdvibes.engine")
 
@@ -36,10 +37,6 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 
 # --- helpers -----------------------------------------------------------------
-def _norm(s: str) -> str:
-    return "".join(ch for ch in s.lower().strip() if ch.isalnum() or ch == " ").strip()
-
-
 def has_audio(track: Track) -> bool:
     """True when the track's song file really exists on disk (a snippet to play)."""
     return (_PROJECT_ROOT / track.file).is_file()
@@ -142,8 +139,7 @@ def check_guess(state: HoldState, guess: str) -> dict:
         raise EngineError(
             f"unknown track {state.pending_answer_id!r} — library may be out of sync"
         )
-    g = _norm(guess)
-    correct = g == _norm(answer.region) or any(g == _norm(a) for a in answer.region_aliases)
+    correct = match_region(guess, answer)
 
     state.rounds_played += 1
     if correct:
@@ -171,11 +167,11 @@ def morph_options(state: HoldState) -> dict:
 
 def apply_morph(state: HoldState, style: str) -> dict:
     """Resolve a free-text style ('make it Bollywood') to a real track."""
-    s = _norm(style)
+    s = normalize_text(style)
     target = None
     for t in DESTINATIONS:
-        hay = " ".join([_norm(t.region), _norm(t.genre), _norm(t.title),
-                        *[_norm(a) for a in t.region_aliases]])
+        hay = " ".join([normalize_text(t.region), normalize_text(t.genre), normalize_text(t.title),
+                        *[normalize_text(a) for a in t.region_aliases]])
         if s and s in hay:
             target = t
             break
@@ -224,7 +220,7 @@ _MAX_CAPTURED_ITEMS = 20
 def capture_detail(state: HoldState, kind: str, value: str) -> dict:
     if len(state.captured) >= _MAX_CAPTURED_ITEMS:
         return {"error": "too_many_details", "captured": dict(state.captured)}
-    key = (_norm(kind) or "note")[:_MAX_DETAIL_KEY_LEN]
+    key = (normalize_text(kind) or "note")[:_MAX_DETAIL_KEY_LEN]
     val = value.strip()[:_MAX_DETAIL_VAL_LEN]
     state.captured[key] = val
     return {"captured": dict(state.captured)}
