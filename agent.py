@@ -77,8 +77,11 @@ class MusicController:
         await self._player.start(room=room, agent_session=session)  # VERIFY signature
         await self.play(games.DEFAULT_BORING.file, volume=VOL_NORMAL)
 
-    async def play(self, file: str, volume: float = VOL_NORMAL) -> None:
-        """Swap to a new loop. Stops the previous one first to avoid layering."""
+    async def play(self, file: str, volume: float = VOL_NORMAL) -> bool:
+        """Swap to a new loop. Stops the previous one first to avoid layering.
+
+        Returns True if the new track started successfully, False otherwise.
+        """
         logger.debug("music.play file=%s volume=%s", file, volume)
         await self._stop_current()
         try:
@@ -87,17 +90,22 @@ class MusicController:
                 AudioConfig(file, volume=volume), loop=True
             )  # VERIFY: AudioConfig accepts (path, volume=...) and play(loop=True)
             self._current_file = file
+            return True
         except FileNotFoundError:
             logger.warning("music file not found (%s) — continuing without it", file)
+            self._current_file = None
+            return False
         except Exception:
             logger.exception("unexpected music play failure — continuing without it")
+            self._current_file = None
+            return False
 
     async def _stop_current(self) -> None:
         if self._handle is not None:
             try:
                 self._handle.stop()                  # VERIFY: PlayHandle.stop()
             except Exception:
-                logger.debug("failed to stop current music handle", exc_info=True)
+                logger.warning("failed to stop current music handle", exc_info=True)
             self._handle = None
 
 
@@ -149,33 +157,46 @@ class HoldAgent(Agent):
         # Greet FIRST. Speak the full hold-line intro as fixed text and WAIT for it
         # to finish — only then start round one. (Letting the model free-call
         # play_guessing_round here made it skip the greeting and jump into a round.)
-        await self.session.say(
-            "Thanks for calling the Brain Rot community! Please hold the line while we "
-            "connect you to our brain-rotted human... meanwhile, let's play."
-        )
+        try:
+            await self.session.say(
+                "Thanks for calling the Brain Rot community! Please hold the line while we "
+                "connect you to our brain-rotted human... meanwhile, let's play."
+            )
+        except Exception:
+            logger.error("failed to deliver greeting", exc_info=True)
+            return
         # Greeting delivered — now kick off the first round.
-        self.session.generate_reply(
-            instructions="Now start round one: call play_guessing_round, then read its "
-            "prompt and the candidate countries. Do not greet again."
-        )
+        try:
+            self.session.generate_reply(
+                instructions="Now start round one: call play_guessing_round, then read its "
+                "prompt and the candidate countries. Do not greet again."
+            )
+        except Exception:
+            logger.error("failed to generate first-round reply", exc_info=True)
 
     # -- the one game: World Cup song-guessing round -------------------------
     @function_tool
     async def play_guessing_round(self, ctx: RunContext[HoldState]) -> dict:
         """Start a World Cup round: give the spoken clue, list candidate host countries."""
-        res = games.start_guess_round(ctx.userdata)
-        logger.debug("round started: has_audio=%s", res["has_audio"])
-        await self._music.play(res["play_file"])
+        try:
+            res = games.start_guess_round(ctx.userdata)
+        except games.EngineError as exc:
+            logger.error("engine failed to start round: %s", exc)
+            return {"error": str(exc)}
+        logger.debug("round track_id=%s file=%s has_audio=%s",
+                     ctx.userdata.pending_answer_id, res["play_file"], res["has_audio"])
+        music_ok = await self._music.play(res["play_file"])
         # answer stays hidden (engine owns it). With real audio, the song now
         # playing IS the clue — ask for the country and don't read a text hint.
-        if res["has_audio"]:
+        effective_audio = res["has_audio"] and music_ok
+        if effective_audio:
             return {
                 "prompt": "Name this one — which country hosted?",
                 "clue": "",
                 "has_audio": True,
                 "options": res["options"],
             }
-        # Fallback: no audio file for this round → read the spoken clue.
+        # Fallback: no audio file for this round (or music failed) → read the spoken clue.
         return {
             "prompt": res["prompt"],
             "clue": res["clue"],
@@ -192,16 +213,30 @@ class HoldAgent(Agent):
         the agent can't narrate a new round without one actually starting, and the
         song/options can only ever come from this tool result.
         """
-        result = games.check_guess(ctx.userdata, guess)
+        try:
+            result = games.check_guess(ctx.userdata, guess)
+        except games.EngineError as exc:
+            logger.error("engine failed to check guess: %s", exc)
+            return {"error": str(exc)}
+        if "error" in result:
+            logger.warning("check_guess returned error: %s", result["error"])
+            return result
         # Deterministically tee up the next round: new (non-repeating) song + options.
-        nxt = games.start_guess_round(ctx.userdata)
-        logger.debug("next round queued via submit_guess: has_audio=%s", nxt["has_audio"])
-        await self._music.play(nxt["play_file"])
+        try:
+            nxt = games.start_guess_round(ctx.userdata)
+        except games.EngineError as exc:
+            logger.error("engine failed to start next round: %s", exc)
+            result["next_round"] = {"error": str(exc)}
+            return result
+        logger.debug("(via submit_guess) track_id=%s file=%s has_audio=%s",
+                     ctx.userdata.pending_answer_id, nxt["play_file"], nxt["has_audio"])
+        music_ok = await self._music.play(nxt["play_file"])
+        effective_audio = nxt["has_audio"] and music_ok
         result["next_round"] = {
-            "prompt": "Name this one — which country hosted?" if nxt["has_audio"]
+            "prompt": "Name this one — which country hosted?" if effective_audio
                       else nxt["prompt"],
-            "clue": "" if nxt["has_audio"] else nxt["clue"],
-            "has_audio": nxt["has_audio"],
+            "clue": "" if effective_audio else nxt["clue"],
+            "has_audio": effective_audio,
             "options": nxt["options"],
         }
         return result
@@ -238,8 +273,16 @@ async def entrypoint(ctx: JobContext) -> None:
     # No dynamic ducking: the stop-and-replay it required tore down the audio
     # stream (AudioMixer timeout). Each round song just plays once, looped, at the
     # fixed low VOL_NORMAL so it sits under the agent's voice.
-    await session.start(agent=HoldAgent(music), room=ctx.room)
-    await music.start(ctx.room, session)
+    try:
+        await session.start(agent=HoldAgent(music), room=ctx.room)
+    except Exception:
+        logger.critical("agent session failed to start", exc_info=True)
+        raise
+    try:
+        await music.start(ctx.room, session)
+    except Exception:
+        logger.error("background music failed to start — session continues without it",
+                     exc_info=True)
 
 
 if __name__ == "__main__":
