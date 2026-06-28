@@ -14,6 +14,7 @@ is still flaky at 4pm.
 """
 
 from __future__ import annotations
+import logging
 import random
 from pathlib import Path
 
@@ -22,6 +23,12 @@ from .library import (
     LANGUAGE_SKINS, DEFAULT_LANGUAGE,
 )
 from .state import HoldState
+
+logger = logging.getLogger("holdvibes.engine")
+
+
+class EngineError(Exception):
+    """Raised when the engine encounters an unrecoverable problem."""
 
 
 # Repo root (engine/.. ) so we can resolve a Track's "assets/..." file path.
@@ -44,7 +51,11 @@ AUDIO_DESTINATIONS: list[Track] = [t for t in DESTINATIONS if has_audio(t)]
 
 
 def resolve_track(track_id: str) -> Track:
-    return BY_ID.get(track_id, DEFAULT_BORING)
+    track = BY_ID.get(track_id)
+    if track is None:
+        logger.warning("unknown track_id %r — falling back to DEFAULT_BORING", track_id)
+        return DEFAULT_BORING
+    return track
 
 
 # --- language re-skin --------------------------------------------------------
@@ -84,8 +95,12 @@ def start_guess_round(state: HoldState, n_options: int = 4) -> dict:
       - options are DISTINCT host countries (no region appears twice), and
       - the answer never repeats the immediately-previous round's track, so the
         song actually changes each round (tracked via state.last_track_id).
+
+    Raises EngineError if the track library is empty.
     """
     pool = AUDIO_DESTINATIONS or DESTINATIONS
+    if not pool:
+        raise EngineError("no tracks available — DESTINATIONS is empty")
     # Don't replay the previous round's track (unless the pool has only one).
     candidates = [t for t in pool if t.id != state.last_track_id] or pool
     answer = random.choice(candidates)
@@ -116,9 +131,17 @@ def start_guess_round(state: HoldState, n_options: int = 4) -> dict:
 def check_guess(state: HoldState, guess: str) -> dict:
     """Grade the in-flight guess. Engine owns correctness + score."""
     if not state.pending_answer_id:
+        logger.warning("check_guess called with no active round")
         return {"error": "no_round_active"}
 
-    answer = BY_ID[state.pending_answer_id]
+    answer = BY_ID.get(state.pending_answer_id)
+    if answer is None:
+        logger.error("pending_answer_id %r not found in library", state.pending_answer_id)
+        state.pending_answer_id = None
+        state.pending_options = []
+        raise EngineError(
+            f"unknown track {state.pending_answer_id!r} — library may be out of sync"
+        )
     g = _norm(guess)
     correct = g == _norm(answer.region) or any(g == _norm(a) for a in answer.region_aliases)
 
