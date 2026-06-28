@@ -79,7 +79,7 @@ class MusicController:
 
     async def play(self, file: str, volume: float = VOL_NORMAL) -> None:
         """Swap to a new loop. Stops the previous one first to avoid layering."""
-        print(f"[DBG music.play] file={file} volume={volume}", flush=True)
+        logger.debug("music.play file=%s volume=%s", file, volume)
         await self._stop_current()
         try:
             # .play() returns a handle we keep so we can stop/replace it later.
@@ -87,15 +87,17 @@ class MusicController:
                 AudioConfig(file, volume=volume), loop=True
             )  # VERIFY: AudioConfig accepts (path, volume=...) and play(loop=True)
             self._current_file = file
-        except Exception as e:                       # never let music kill the call
-            logger.warning("music play failed (%s) — continuing without it", e)
+        except FileNotFoundError:
+            logger.warning("music file not found (%s) — continuing without it", file)
+        except Exception:
+            logger.exception("unexpected music play failure — continuing without it")
 
     async def _stop_current(self) -> None:
         if self._handle is not None:
             try:
                 self._handle.stop()                  # VERIFY: PlayHandle.stop()
             except Exception:
-                pass
+                logger.debug("failed to stop current music handle", exc_info=True)
             self._handle = None
 
 
@@ -162,8 +164,7 @@ class HoldAgent(Agent):
     async def play_guessing_round(self, ctx: RunContext[HoldState]) -> dict:
         """Start a World Cup round: give the spoken clue, list candidate host countries."""
         res = games.start_guess_round(ctx.userdata)
-        print(f"[DBG round] track_id={ctx.userdata.pending_answer_id} "
-              f"file={res['play_file']} has_audio={res['has_audio']}", flush=True)
+        logger.debug("round started: has_audio=%s", res["has_audio"])
         await self._music.play(res["play_file"])
         # answer stays hidden (engine owns it). With real audio, the song now
         # playing IS the clue — ask for the country and don't read a text hint.
@@ -194,8 +195,7 @@ class HoldAgent(Agent):
         result = games.check_guess(ctx.userdata, guess)
         # Deterministically tee up the next round: new (non-repeating) song + options.
         nxt = games.start_guess_round(ctx.userdata)
-        print(f"[DBG round] (via submit_guess) track_id={ctx.userdata.pending_answer_id} "
-              f"file={nxt['play_file']} has_audio={nxt['has_audio']}", flush=True)
+        logger.debug("next round queued via submit_guess: has_audio=%s", nxt["has_audio"])
         await self._music.play(nxt["play_file"])
         result["next_round"] = {
             "prompt": "Name this one — which country hosted?" if nxt["has_audio"]

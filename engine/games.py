@@ -193,8 +193,17 @@ def lore_card(state: HoldState) -> dict:
 
 
 # --- productive beat ----------------------------------------------------------
+_MAX_DETAIL_KEY_LEN = 64
+_MAX_DETAIL_VAL_LEN = 256
+_MAX_CAPTURED_ITEMS = 20
+
+
 def capture_detail(state: HoldState, kind: str, value: str) -> dict:
-    state.captured[_norm(kind) or "note"] = value.strip()
+    if len(state.captured) >= _MAX_CAPTURED_ITEMS:
+        return {"error": "too_many_details", "captured": dict(state.captured)}
+    key = (_norm(kind) or "note")[:_MAX_DETAIL_KEY_LEN]
+    val = value.strip()[:_MAX_DETAIL_VAL_LEN]
+    state.captured[key] = val
     return {"captured": dict(state.captured)}
 
 
